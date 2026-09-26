@@ -292,3 +292,104 @@ TEST(PayloadRemove, SweepingNothingIsFine) {
     EXPECT_EQ(xim::sweep_payload_trash(xim::payload_trash_root(fx.payload())), 0);
     EXPECT_EQ(xim::sweep_payload_trash({}), 0);
 }
+
+// ── replacing a stale payload (#620) ─────────────────────────────────
+//
+// The reinstall of a payload whose recipe revision moved on must never leave
+// the version without a payload: the old tree is set aside, the new one is
+// installed at the real path, and the old one is either deleted (commit) or
+// put back (rollback, or destruction without commit).
+
+namespace {
+
+std::string read_(const fs::path& p) {
+    std::ifstream in(p);
+    return {std::istreambuf_iterator<char>(in), {}};
+}
+
+}  // namespace
+
+TEST(PayloadReplace, SetAsideLeavesAnEmptyPathAndParksOutsideTheStore) {
+    StoreFixture fx{"replace-aside"};
+    fx.file("bin/node", "old");
+    fx.file(".mcpp_ok", "mcpp");
+
+    auto aside = xim::set_aside_payload(fx.payload());
+    ASSERT_TRUE(aside) << aside.error();
+
+    EXPECT_TRUE(fs::is_directory(fx.payload()));
+    EXPECT_TRUE(fs::is_empty(fx.payload()))
+        << "the install hook needs its install_dir, and an empty one";
+    EXPECT_EQ(read_(aside->parked() / "bin" / "node"), "old");
+    EXPECT_EQ(aside->parked().parent_path(), fx.root / "data" / "stale");
+
+    // Parked where no store scan reads it as a version of this package.
+    EXPECT_EQ(fx.versions_as_seen_by_the_store(),
+              std::vector<std::string>{"22.17.1"});
+    aside->commit();
+}
+
+TEST(PayloadReplace, CommitDeletesTheOldTreeWithWhatOtherToolsWroteIntoIt) {
+    StoreFixture fx{"replace-commit"};
+    fx.file("bin/node", "old");
+    fx.file(".mcpp_ok", "mcpp");
+    fx.file(".mcpp-fixup.json", "{}");
+
+    auto aside = xim::set_aside_payload(fx.payload());
+    ASSERT_TRUE(aside) << aside.error();
+    const auto parked = aside->parked();
+    fx.file("bin/node", "new");
+    aside->commit();
+
+    EXPECT_EQ(read_(fx.payload() / "bin" / "node"), "new");
+    EXPECT_FALSE(fs::exists(fx.payload() / ".mcpp_ok"))
+        << "a marker written about the old payload must not describe the new one";
+    EXPECT_FALSE(fs::exists(fx.payload() / ".mcpp-fixup.json"));
+    EXPECT_FALSE(fs::exists(parked));
+    EXPECT_FALSE(fs::exists(fx.root / "data" / "stale"))
+        << "an empty parking directory is noise in the data dir";
+}
+
+TEST(PayloadReplace, RollbackPutsTheOldPayloadBackAndDropsThePartialOne) {
+    StoreFixture fx{"replace-rollback"};
+    fx.file("bin/node", "old");
+    fx.file(".mcpp_ok", "mcpp");
+
+    auto aside = xim::set_aside_payload(fx.payload());
+    ASSERT_TRUE(aside) << aside.error();
+    fx.file("bin/node", "partial");
+    fx.file("lib/half-written.so", "partial");
+
+    EXPECT_EQ(aside->rollback(), "");
+    EXPECT_EQ(read_(fx.payload() / "bin" / "node"), "old");
+    EXPECT_TRUE(fs::exists(fx.payload() / ".mcpp_ok"));
+    EXPECT_FALSE(fs::exists(fx.payload() / "lib" / "half-written.so"));
+    EXPECT_FALSE(fs::exists(fx.root / "data" / "stale"));
+}
+
+// Every early exit of an install step is a scope exit. The destructor is what
+// makes all of them restore the old payload without each remembering to.
+TEST(PayloadReplace, LeavingScopeWithoutCommitRollsBack) {
+    StoreFixture fx{"replace-scope"};
+    fx.file("bin/node", "old");
+    {
+        auto aside = xim::set_aside_payload(fx.payload());
+        ASSERT_TRUE(aside) << aside.error();
+        fx.file("bin/node", "partial");
+    }
+    EXPECT_EQ(read_(fx.payload() / "bin" / "node"), "old");
+}
+
+TEST(PayloadReplace, AMoveThatIsRefusedLeavesThePayloadInPlace) {
+    if (running_as_root()) GTEST_SKIP() << "root ignores directory write bits";
+    StoreFixture fx{"replace-refused"};
+    fx.file("bin/node", "old");
+    freeze_(fx.pkgDir());
+
+    auto aside = xim::set_aside_payload(fx.payload());
+    thaw_(fx.pkgDir());
+
+    EXPECT_FALSE(aside) << "a reinstall that cannot keep the old payload "
+                           "recoverable must not start";
+    EXPECT_EQ(read_(fx.payload() / "bin" / "node"), "old");
+}

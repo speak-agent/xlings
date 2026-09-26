@@ -3,6 +3,7 @@ module xlings.core.xim.payload;
 import std;
 import xlings.platform;
 import xlings.core.config;
+import xlings.core.log;
 
 namespace xlings::xim {
 
@@ -224,7 +225,30 @@ int stamped_registration_count(const std::filesystem::path& dir) {
     return any ? value : kRegisteredUnrecorded;
 }
 
-void write_payload_stamp(const std::filesystem::path& dir, std::string_view version, int registered) {
+int stamped_revision(const std::filesystem::path& dir) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    const auto stamp = dir / std::filesystem::path(kPayloadStampFile);
+    if (!fs::is_regular_file(stamp, ec)) return kRevisionUnrecorded;
+    // Scanned by hand, for the reason given at classify_payload_platform.
+    const auto content = platform::read_file_to_string(stamp.string());
+    const auto key = content.find("\"revision\"");
+    if (key == std::string::npos) return 0;
+    const auto colon = content.find(':', key);
+    if (colon == std::string::npos) return 0;
+    std::size_t i = colon + 1;
+    while (i < content.size() && (content[i] == ' ' || content[i] == '\t')) ++i;
+    long long value = 0;
+    while (i < content.size() && content[i] >= '0' && content[i] <= '9') {
+        value = value * 10 + (content[i] - '0');
+        if (value > std::numeric_limits<int>::max()) return 0;
+        ++i;
+    }
+    return static_cast<int>(value);
+}
+
+void write_payload_stamp(const std::filesystem::path& dir, std::string_view version,
+                         int registered, int revision) {
     namespace fs = std::filesystem;
     std::error_code ec;
     if (!fs::is_directory(dir, ec)) return;
@@ -241,6 +265,7 @@ void write_payload_stamp(const std::filesystem::path& dir, std::string_view vers
     if (registered != kRegisteredUnrecorded) {
         text += std::format(",\n  \"registered\": {}", registered);
     }
+    text += std::format(",\n  \"revision\": {}", std::max(revision, 0));
     text += "\n}\n";
     platform::write_string_to_file(
         (dir / std::filesystem::path(kPayloadStampFile)).string(), text);
@@ -430,4 +455,114 @@ RemoveOutcome settle_removal(const fs::path& root, std::string_view version) {
         "uninstall could not remove every file -- something is holding one");
     return RemoveOutcome::Partial;
 }
+
+// ── replacing a payload that is installed but stale ──────────────────
+
+fs::path stale_payload_parking(const fs::path& payloadDir) {
+    const auto pid = std::to_string(platform::get_pid());
+    fs::path base;
+    for (auto dir = payloadDir; dir.has_relative_path(); dir = dir.parent_path()) {
+        if (dir.filename() == "xpkgs") {
+            base = dir.parent_path() / "stale" /
+                (payloadDir.parent_path().filename().string() + "-" +
+                 payloadDir.filename().string() + ".stale-" + pid);
+            break;
+        }
+        if (dir.parent_path() == dir) break;
+    }
+    if (base.empty()) {
+        base = payloadDir.parent_path() /
+            (payloadDir.filename().string() + ".stale-" + pid);
+    }
+    std::error_code ignore;
+    auto candidate = base;
+    for (int n = 1; fs::exists(candidate, ignore) && n < 1000; ++n) {
+        candidate = base;
+        candidate += "-" + std::to_string(n);
+    }
+    return candidate;
+}
+
+std::expected<PayloadReplacement, std::string>
+set_aside_payload(const fs::path& payloadDir) {
+    const auto parked = stale_payload_parking(payloadDir);
+    std::error_code ec;
+    fs::create_directories(parked.parent_path(), ec);
+    ec.clear();
+    fs::rename(payloadDir, parked, ec);
+    if (ec) {
+        return std::unexpected(std::format(
+            "cannot move {} aside to {}: {}",
+            payloadDir.string(), parked.string(), ec.message()));
+    }
+    fs::create_directories(payloadDir, ec);
+    if (ec || !fs::is_directory(payloadDir, ec)) {
+        const auto why = ec.message();
+        std::error_code back;
+        fs::remove(payloadDir, back);
+        fs::rename(parked, payloadDir, back);
+        return std::unexpected(std::format(
+            "cannot recreate {}: {}", payloadDir.string(), why));
+    }
+    return PayloadReplacement(payloadDir, parked);
+}
+
+PayloadReplacement::PayloadReplacement(fs::path payloadDir, fs::path parkedDir)
+    : payloadDir_(std::move(payloadDir)), parkedDir_(std::move(parkedDir)) {}
+
+PayloadReplacement::PayloadReplacement(PayloadReplacement&& other) noexcept
+    : payloadDir_(std::move(other.payloadDir_)),
+      parkedDir_(std::move(other.parkedDir_)),
+      settled_(other.settled_) {
+    other.settled_ = true;
+}
+
+PayloadReplacement::~PayloadReplacement() {
+    if (settled_) return;
+    try {
+        const auto left = rollback();
+        if (left.empty()) {
+            log::info("kept the previous payload at {}", payloadDir_.string());
+        } else {
+            log::warn("the reinstall into {} did not complete, and {}",
+                      payloadDir_.string(), left);
+        }
+    } catch (...) {
+        // A destructor reports nothing it cannot report safely.
+    }
+}
+
+const fs::path& PayloadReplacement::parked() const { return parkedDir_; }
+
+void PayloadReplacement::commit() {
+    if (settled_) return;
+    settled_ = true;
+    (void)remove_payload_dir(parkedDir_);
+    std::error_code ignore;
+    fs::remove(parkedDir_.parent_path(), ignore);   // only when now empty
+}
+
+std::string PayloadReplacement::rollback() {
+    if (settled_) return {};
+    settled_ = true;
+    // A partial tree that cannot be deleted is left stamped incomplete by
+    // remove_payload_dir, and the old one stays parked: renaming over a
+    // non-empty directory is not possible, and merging the two would produce
+    // a payload neither install wrote.
+    if (remove_payload_dir(payloadDir_) != RemoveOutcome::Removed) {
+        return std::format("the previous payload is kept at {}",
+                           parkedDir_.string());
+    }
+    std::error_code ec;
+    fs::remove(payloadDir_, ec);
+    ec.clear();
+    fs::rename(parkedDir_, payloadDir_, ec);
+    if (ec) {
+        return std::format("the previous payload is kept at {} ({})",
+                           parkedDir_.string(), ec.message());
+    }
+    fs::remove(parkedDir_.parent_path(), ec);   // only when now empty
+    return {};
+}
+
 }
